@@ -1,5 +1,5 @@
 /**
- * 安福二中论坛 API - Workers + D1
+ * 安福二中论坛 API - Workers + D1 (含跳蚤市场)
  */
 const PBKDF2_ITERATIONS = 100000;
 const CODE_TTL_MINUTES = 10;
@@ -60,10 +60,7 @@ async function verifyPassword(password, stored) {
 
 async function sendEmailCode(env, toEmail, code) {
   const apiKey = env.RESEND_API_KEY;
-  if (!apiKey) {
-    console.log(`[DEV] 验证码 ${code} -> ${toEmail}`);
-    return { ok: true, dev: true };
-  }
+  if (!apiKey) { console.log(`[DEV] 验证码 ${code} -> ${toEmail}`); return { ok: true, dev: true }; }
   const from = env.EMAIL_FROM || '安福二中论坛 <onboarding@resend.dev>';
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -321,6 +318,65 @@ async function handleCreateComment(request, env, postId) {
   return json({ ok: true, message: '回复成功' });
 }
 
+async function handleListMarket(request, env) {
+  const url = new URL(request.url);
+  const page = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10));
+  const limit = 20;
+  const offset = (page - 1) * limit;
+  const q = (url.searchParams.get('q') || '').trim();
+  let sql = `SELECT m.id, m.title, m.description, m.price, m.status, m.created_at,
+                    u.uid, u.nickname, u.avatar
+             FROM market_items m JOIN users u ON u.id = m.user_id
+             WHERE m.status = 'available'`;
+  const params = [];
+  if (q) {
+    sql += ` AND (m.title LIKE ? OR m.description LIKE ?)`;
+    params.push('%' + q + '%', '%' + q + '%');
+  }
+  sql += ' ORDER BY m.created_at DESC LIMIT ? OFFSET ?';
+  params.push(limit, offset);
+  const rows = await env.DB.prepare(sql).bind(...params).all();
+  return json({ items: rows.results || [], page, limit });
+}
+
+async function handleGetMarketItem(request, env, id) {
+  const item = await env.DB.prepare(
+    `SELECT m.*, u.uid, u.nickname, u.avatar FROM market_items m
+     JOIN users u ON u.id = m.user_id WHERE m.id = ?`
+  ).bind(id).first();
+  if (!item) return error('商品不存在', 404);
+  return json({ item });
+}
+
+async function handleCreateMarketItem(request, env) {
+  const user = await getAuthUser(request, env);
+  if (!user) return error('请先登录', 401);
+  const body = await request.json().catch(() => null);
+  if (!body) return error('无效请求体');
+  const title = (body.title || '').trim();
+  const description = (body.description || '').trim();
+  let price = body.price;
+  if (!title || title.length < 2) return error('标题至少2个字');
+  if (title.length > 60) return error('标题最多60字');
+  if (price === undefined || price === null || price === '') return error('请填写价格');
+  price = Number(price);
+  if (isNaN(price) || price < 0) return error('价格不合法');
+  const result = await env.DB.prepare(
+    `INSERT INTO market_items (user_id, title, description, price, status) VALUES (?, ?, ?, ?, 'available')`
+  ).bind(user.id, title, description, price).run();
+  return json({ ok: true, id: result.meta?.last_row_id, message: '发布成功' });
+}
+
+async function handleSoldMarketItem(request, env, id) {
+  const user = await getAuthUser(request, env);
+  if (!user) return error('请先登录', 401);
+  const item = await env.DB.prepare('SELECT id, user_id FROM market_items WHERE id = ?').bind(id).first();
+  if (!item) return error('商品不存在', 404);
+  if (item.user_id !== user.id) return error('只能操作自己的商品', 403);
+  await env.DB.prepare(`UPDATE market_items SET status = 'sold' WHERE id = ?`).bind(id).run();
+  return json({ ok: true, message: '已标记售出' });
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === 'OPTIONS') {
@@ -349,6 +405,12 @@ export default {
       if (likeMatch && request.method === 'POST') return await handleLikePost(request, env, parseInt(likeMatch[1], 10));
       const commentMatch = path.match(/^\/api\/posts\/(\d+)\/comments$/);
       if (commentMatch && request.method === 'POST') return await handleCreateComment(request, env, parseInt(commentMatch[1], 10));
+      if (path === '/api/market' && request.method === 'GET') return await handleListMarket(request, env);
+      if (path === '/api/market' && request.method === 'POST') return await handleCreateMarketItem(request, env);
+      const marketMatch = path.match(/^\/api\/market\/(\d+)$/);
+      if (marketMatch && request.method === 'GET') return await handleGetMarketItem(request, env, parseInt(marketMatch[1], 10));
+      const marketSold = path.match(/^\/api\/market\/(\d+)\/sold$/);
+      if (marketSold && request.method === 'POST') return await handleSoldMarketItem(request, env, parseInt(marketSold[1], 10));
       if (path === '/' || path === '/api/health') return json({ status: 'ok', name: '安福二中论坛 API' });
       return error('接口不存在', 404);
     } catch (e) {
