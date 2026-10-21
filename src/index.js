@@ -1,6 +1,5 @@
 /**
  * 安福二中论坛 API - Workers + D1
- * 密码 PBKDF2；注册验证码；贴吧帖子
  */
 const PBKDF2_ITERATIONS = 100000;
 const CODE_TTL_MINUTES = 10;
@@ -26,8 +25,7 @@ function generateToken() {
   return Array.from(arr).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 function generateCode() {
-  const n = crypto.getRandomValues(new Uint32Array(1))[0] % 1000000;
-  return String(n).padStart(6, '0');
+  return String(crypto.getRandomValues(new Uint32Array(1))[0] % 1000000).padStart(6, '0');
 }
 function toHex(buf) {
   return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -72,7 +70,7 @@ async function sendEmailCode(env, toEmail, code) {
     headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       from, to: [toEmail], subject: '【安福二中论坛】邮箱验证码',
-      html: `<div style="font-family:sans-serif;padding:20px"><h2>安福二中论坛</h2><p>验证码：</p><p style="font-size:28px;font-weight:bold;letter-spacing:6px;color:#7c3aed">${code}</p><p>${CODE_TTL_MINUTES}分钟内有效</p></div>`,
+      html: `<div style="font-family:sans-serif;padding:20px"><h2>安福二中论坛</h2><p style="font-size:28px;font-weight:bold;color:#7c3aed">${code}</p><p>${CODE_TTL_MINUTES}分钟内有效</p></div>`,
       text: `验证码：${code}`,
     }),
   });
@@ -188,6 +186,17 @@ async function getAuthUser(request, env) {
   return session;
 }
 
+async function ensureBoard(env, board_id) {
+  let board = await env.DB.prepare('SELECT id FROM boards WHERE id = ?').bind(board_id).first();
+  if (board) return;
+  const names = {
+    daily: '日常', biaobai: '表白', xunwu: '寻物招领', help: '求助',
+    study: '学习交流', anonymous: '匿名墙', life: '生活分享', fun: '娱乐灌水',
+  };
+  await env.DB.prepare('INSERT OR IGNORE INTO boards (id, name, icon, description, sort_order) VALUES (?, ?, ?, ?, 0)')
+    .bind(board_id, names[board_id] || board_id, board_id === 'anonymous' ? '🎭' : (board_id === 'biaobai' ? '💕' : '📌'), '').run();
+}
+
 async function handleBoards(env) {
   const rows = await env.DB.prepare(`SELECT b.*, (SELECT COUNT(*) FROM posts p WHERE p.board_id = b.id) as post_count FROM boards b ORDER BY b.sort_order ASC`).all();
   return json({ boards: rows.results || [] });
@@ -196,20 +205,47 @@ async function handleBoards(env) {
 async function handleListPosts(request, env) {
   const url = new URL(request.url);
   const boardId = url.searchParams.get('board') || '';
+  const hot = url.searchParams.get('hot') === '1';
   const page = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10));
   const limit = 20;
   const offset = (page - 1) * limit;
-  let sql = `SELECT p.id, p.board_id, p.title, p.content, p.view_count, p.reply_count, p.is_pinned, p.created_at, p.updated_at, u.uid, u.nickname, u.avatar, b.name as board_name FROM posts p JOIN users u ON u.id = p.user_id JOIN boards b ON b.id = p.board_id`;
+  let sql = `SELECT p.id, p.board_id, p.title, p.content, p.view_count, p.reply_count, p.is_pinned,
+                    COALESCE(p.like_count, 0) as like_count, COALESCE(p.is_anonymous, 0) as is_anonymous,
+                    p.created_at, p.updated_at, u.uid, u.nickname, u.avatar, b.name as board_name
+             FROM posts p JOIN users u ON u.id = p.user_id LEFT JOIN boards b ON b.id = p.board_id`;
   const params = [];
-  if (boardId) { sql += ' WHERE p.board_id = ?'; params.push(boardId); }
-  sql += ' ORDER BY p.is_pinned DESC, p.updated_at DESC LIMIT ? OFFSET ?';
+  const where = [];
+  if (boardId) { where.push('p.board_id = ?'); params.push(boardId); }
+  if (hot) { where.push('COALESCE(p.like_count, 0) >= 5'); }
+  if (where.length) sql += ' WHERE ' + where.join(' AND ');
+  sql += hot
+    ? ' ORDER BY COALESCE(p.like_count, 0) DESC, p.updated_at DESC LIMIT ? OFFSET ?'
+    : ' ORDER BY p.is_pinned DESC, p.updated_at DESC LIMIT ? OFFSET ?';
   params.push(limit, offset);
-  const rows = await env.DB.prepare(sql).bind(...params).all();
-  return json({ posts: rows.results || [], page, limit });
+  try {
+    const rows = await env.DB.prepare(sql).bind(...params).all();
+    return json({ posts: rows.results || [], page, limit });
+  } catch (e) {
+    let sql2 = `SELECT p.id, p.board_id, p.title, p.content, p.view_count, p.reply_count, p.is_pinned,
+                       p.created_at, p.updated_at, u.uid, u.nickname, u.avatar, b.name as board_name
+                FROM posts p JOIN users u ON u.id = p.user_id LEFT JOIN boards b ON b.id = p.board_id`;
+    const params2 = [];
+    if (boardId) { sql2 += ' WHERE p.board_id = ?'; params2.push(boardId); }
+    sql2 += ' ORDER BY p.is_pinned DESC, p.updated_at DESC LIMIT ? OFFSET ?';
+    params2.push(limit, offset);
+    const rows = await env.DB.prepare(sql2).bind(...params2).all();
+    const posts = (rows.results || []).map((p) => ({ ...p, like_count: 0, is_anonymous: p.board_id === 'anonymous' ? 1 : 0 }));
+    return json({ posts, page, limit });
+  }
 }
 
 async function handleGetPost(request, env, postId) {
-  const post = await env.DB.prepare(`SELECT p.*, u.uid, u.nickname, u.avatar, b.name as board_name FROM posts p JOIN users u ON u.id = p.user_id JOIN boards b ON b.id = p.board_id WHERE p.id = ?`).bind(postId).first();
+  let post;
+  try {
+    post = await env.DB.prepare(`SELECT p.*, COALESCE(p.like_count,0) as like_count, COALESCE(p.is_anonymous,0) as is_anonymous, u.uid, u.nickname, u.avatar, b.name as board_name FROM posts p JOIN users u ON u.id = p.user_id LEFT JOIN boards b ON b.id = p.board_id WHERE p.id = ?`).bind(postId).first();
+  } catch {
+    post = await env.DB.prepare(`SELECT p.*, u.uid, u.nickname, u.avatar, b.name as board_name FROM posts p JOIN users u ON u.id = p.user_id LEFT JOIN boards b ON b.id = p.board_id WHERE p.id = ?`).bind(postId).first();
+  }
   if (!post) return error('帖子不存在', 404);
   await env.DB.prepare('UPDATE posts SET view_count = view_count + 1 WHERE id = ?').bind(postId).run();
   const comments = await env.DB.prepare(`SELECT c.id, c.content, c.parent_id, c.created_at, u.uid, u.nickname, u.avatar FROM comments c JOIN users u ON u.id = c.user_id WHERE c.post_id = ? ORDER BY c.id ASC`).bind(postId).all();
@@ -221,13 +257,56 @@ async function handleCreatePost(request, env) {
   if (!user) return error('请先登录', 401);
   const body = await request.json().catch(() => null);
   if (!body) return error('无效请求体');
-  const { board_id, title, content } = body;
+  let { board_id, title, content, is_anonymous } = body;
   if (!board_id || !title || !content) return error('请填写板块、标题和内容');
   if (title.trim().length < 2 || title.trim().length > 80) return error('标题长度 2-80 字');
-  const board = await env.DB.prepare('SELECT id FROM boards WHERE id = ?').bind(board_id).first();
-  if (!board) return error('板块不存在');
-  const result = await env.DB.prepare(`INSERT INTO posts (board_id, user_id, title, content) VALUES (?, ?, ?, ?)`).bind(board_id, user.id, title.trim(), content.trim()).run();
-  return json({ ok: true, id: result.meta?.last_row_id, message: '发帖成功' });
+  const isAnon = !!is_anonymous || board_id === 'anonymous';
+  if (isAnon) board_id = 'anonymous';
+  await ensureBoard(env, board_id);
+  try {
+    const result = await env.DB.prepare(
+      `INSERT INTO posts (board_id, user_id, title, content, is_anonymous) VALUES (?, ?, ?, ?, ?)`
+    ).bind(board_id, user.id, title.trim(), content.trim(), isAnon ? 1 : 0).run();
+    return json({ ok: true, id: result.meta?.last_row_id, message: '发帖成功' });
+  } catch (e) {
+    const result = await env.DB.prepare(
+      `INSERT INTO posts (board_id, user_id, title, content) VALUES (?, ?, ?, ?)`
+    ).bind(board_id, user.id, title.trim(), content.trim()).run();
+    return json({ ok: true, id: result.meta?.last_row_id, message: '发帖成功' });
+  }
+}
+
+async function handleLikePost(request, env, postId) {
+  const user = await getAuthUser(request, env);
+  if (!user) return error('请先登录', 401);
+  const post = await env.DB.prepare('SELECT id FROM posts WHERE id = ?').bind(postId).first();
+  if (!post) return error('帖子不存在', 404);
+  try {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS post_likes (
+      post_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (post_id, user_id)
+    )`).run();
+  } catch (_) {}
+  const existed = await env.DB.prepare('SELECT 1 FROM post_likes WHERE post_id = ? AND user_id = ?').bind(postId, user.id).first();
+  if (existed) {
+    let like_count = 0;
+    try {
+      const row = await env.DB.prepare('SELECT COALESCE(like_count, 0) as like_count FROM posts WHERE id = ?').bind(postId).first();
+      like_count = row?.like_count || 0;
+    } catch (_) {}
+    return json({ ok: true, like_count, message: '已点过赞' });
+  }
+  await env.DB.prepare('INSERT INTO post_likes (post_id, user_id) VALUES (?, ?)').bind(postId, user.id).run();
+  try {
+    await env.DB.prepare('UPDATE posts SET like_count = COALESCE(like_count, 0) + 1 WHERE id = ?').bind(postId).run();
+  } catch (_) {}
+  let like_count = 1;
+  try {
+    const row = await env.DB.prepare('SELECT COALESCE(like_count, 0) as like_count FROM posts WHERE id = ?').bind(postId).first();
+    like_count = row?.like_count || 1;
+  } catch (_) {}
+  return json({ ok: true, like_count });
 }
 
 async function handleCreateComment(request, env, postId) {
@@ -266,6 +345,8 @@ export default {
       if (path === '/api/posts' && request.method === 'POST') return await handleCreatePost(request, env);
       const postMatch = path.match(/^\/api\/posts\/(\d+)$/);
       if (postMatch && request.method === 'GET') return await handleGetPost(request, env, parseInt(postMatch[1], 10));
+      const likeMatch = path.match(/^\/api\/posts\/(\d+)\/like$/);
+      if (likeMatch && request.method === 'POST') return await handleLikePost(request, env, parseInt(likeMatch[1], 10));
       const commentMatch = path.match(/^\/api\/posts\/(\d+)\/comments$/);
       if (commentMatch && request.method === 'POST') return await handleCreateComment(request, env, parseInt(commentMatch[1], 10));
       if (path === '/' || path === '/api/health') return json({ status: 'ok', name: '安福二中论坛 API' });
