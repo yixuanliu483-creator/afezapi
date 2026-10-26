@@ -226,6 +226,7 @@ export async function handleListPosts(request, env) {
   const offset = (page - 1) * limit;
   let sql = `SELECT p.id, p.board_id, p.title, p.content, p.view_count, p.reply_count, p.is_pinned,
                     COALESCE(p.like_count, 0) as like_count, COALESCE(p.is_anonymous, 0) as is_anonymous,
+                    COALESCE(p.is_reported, 0) as is_reported,
                     p.created_at, p.updated_at, u.uid, u.nickname, u.avatar, b.name as board_name
              FROM posts p JOIN users u ON u.id = p.user_id LEFT JOIN boards b ON b.id = p.board_id`;
   const params = [];
@@ -246,6 +247,6 @@ export async function handleListPosts(request, env) {
     sql2 += ' ORDER BY p.is_pinned DESC, p.updated_at DESC LIMIT ? OFFSET ?';
     params2.push(limit, offset);
     const rows = await env.DB.prepare(sql2).bind(...params2).all();
-    return json({ posts: (rows.results || []).map((p) => ({ ...p, like_count: 0, is_anonymous: p.board_id === 'anonymous' ? 1 : 0 })), page, limit });
+    return json({ posts: (rows.results || []).map((p) => ({ ...p, like_count: 0, is_anonymous: p.board_id === 'anonymous' ? 1 : 0, is_reported: 0 })), page, limit });
   }
 }
