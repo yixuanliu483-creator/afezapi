@@ -22,7 +22,18 @@ export async function handleGetPost(request, env, postId) {
   const user = await getAuthUser(request, env);
   const votes = await getVoteStats(env, postId, user && user.id);
   post.is_reported = post.is_reported ? 1 : 0;
-  return json({ post, comments: comments.results || [], votes });
+  const isAnonPost = !!(post.is_anonymous || post.board_id === 'anonymous');
+  let commentList = comments.results || [];
+  if (isAnonPost) {
+    commentList = commentList.map((c) => ({
+      ...c,
+      nickname: '匿名用户',
+      uid: '0000000',
+      avatar: null,
+      is_anonymous: 1,
+    }));
+  }
+  return json({ post, comments: commentList, votes });
 }
 
 export async function handleCreatePost(request, env) {
